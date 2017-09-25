@@ -9,7 +9,6 @@ const Context = require('slapp-context-beepboop')
 const dns = require('dns');
 const arrify = require('arrify');
 const got = require('got');
-const isPortReachable = require('is-port-reachable');
 const pAny = require('p-any');
 const pify = require('pify');
 const pn = require('port-numbers');
