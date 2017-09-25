@@ -3,60 +3,96 @@ const express = require('express')
 const Slapp = require('slapp')
 const ConvoStore = require('slapp-convo-beepboop')
 const Context = require('slapp-context-beepboop')
+var util   = require('util');
+var spawn = require('child_process').spawn;
+var dns = require('dns');
 
-//ping 
+var ping = function(host, cb){
 
-const dns = require('dns');
-const arrify = require('arrify');
-const got = require('got');
-const pAny = require('p-any');
-const pify = require('pify');
-const pn = require('port-numbers');
-const pTimeout = require('p-timeout');
-const prependHttp = require('prepend-http');
-const routerIps = require('router-ips');
-const URL = require('url-parse');
+  if(!host || typeof host !== 'string'){
+    cb(new Error('No host'));
+    return;
+  }
 
-const checkRedirection = url => {
-	return got(url).then(res => {
-		return !routerIps.has((new URL(res.headers.location || '')).hostname);
-	}).catch(() => false);
+  var data = {};
+  var stdout = '';
+  var stderr = '';
+  var error;
+
+  var cp = spawn('ping', ['-n', '-W 2000', '-c 1', host]);
+
+  cp.stdout.on('data', function (data) {
+    stdout += data;
+  });
+
+  cp.stderr.on('data', function (data) {
+    stderr += data;
+  });
+
+  cp.on('exit',function(code){
+    data.code = code;
+
+
+    if(code > 0 && code !== 2) {
+      error = new Error(stderr);
+      data.stdout = stdout;
+      data.stderr = stderr;
+      return cb(error,data);
+    }
+
+    var stdoutLines = stdout.split("\n");
+    var ipRe = /\(([\d\.]+)\)/;
+    var matches;
+
+    if((matches = stdoutLines[0].match(ipRe)) && (data.ip = matches[1]) && !data.ip){
+      error = new Error("ping had malformed stdout: " + stdout);
+      return cb(error,data);
+    }
+
+    if(code === 2){
+      error = new Error('Request timeout');
+      return cb(error,data);
+    }
+
+    data.msg = stdoutLines[1];
+    if(!data.msg){
+      error = new Error("ping had malformed stdout: " + stdout);
+      return cb(error,data);
+    }
+
+    var re = /(\d+) bytes from (.+): icmp_(?:r|s)eq=(\d+) ttl=(\d+) time=([\d.]+) ms/;
+    var parts = data.msg.match(re);
+
+    if(!parts.length){
+      error = new Error("ping had malformed stdout: " + stdout);
+      return cb(error,data);
+    }
+
+    data.bytes = Number(parts[1]);
+    data.ttl = Number(parts[4]);
+    data.time = Number(parts[5]);
+
+    cb(error, data);
+
+  });
 };
 
-function isTargetReachable(url) {
-	const uri = new URL(prependHttp(url));
-	const hostname = uri.hostname;
-	let protocol = uri.protocol;
-	const port = Number(uri.port) || pn.getPort(protocol.slice(0, -1)).port || 80;
+var pingWithLookup = function(host,cb){
 
-	if (!/^[a-z]+:\/\//.test(url) && port !== 80 && port !== 443) {
-		protocol = pn.getService(port).name + ':';
-	}
+  if(!cb){
+    cb = function(){};
+  }
 
-	return pify(dns.lookup)(hostname).then(address => {
-		if (!address) {
-			return false;
-		}
-
-		if (routerIps.has(address)) {
-			return false;
-		}
-
-		if (protocol === 'http:' || protocol === 'https:') {
-			return checkRedirection(url);
-		}
-
-		return isPortReachable(port, {host: address});
-	}).catch(() => false);
-}
-
-module.exports = (dests, opts) => {
-	opts = opts || {};
-	opts.timeout = typeof opts.timeout === 'number' ? opts.timeout : 5000;
-
-	const p = pAny(arrify(dests).map(isTargetReachable));
-	return pTimeout(p, opts.timeout).catch(() => false);
+  dns.lookup(host,4,function(err, address){
+    if(err){
+      return cb(err, address);
+    }
+    ping(address, cb);
+  });
 };
+
+module.exports = exports = pingWithLookup;
+
 
 // Beep Boop
 var port = process.env.PORT || 3000
