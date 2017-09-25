@@ -1,6 +1,5 @@
 'use strict'
-import "ping.js";
-
+require('ping.js');
 const express = require('express')
 const Slapp = require('slapp')
 const ConvoStore = require('slapp-convo-beepboop')
