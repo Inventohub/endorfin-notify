@@ -1,4 +1,5 @@
 'use strict'
+import "ping.js";
 
 const express = require('express')
 const Slapp = require('slapp')
