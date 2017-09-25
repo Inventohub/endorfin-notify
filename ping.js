@@ -1,747 +1,356 @@
+/**
+ * @fileOverview
+ * A simple promises-based check to see if a TCP port is already in use.
+ */
 'use strict';
-var assert = require('assert');
-var tcpPortUsed = require('./index');
+
+// define the exports first to avoid cyclic dependencies.
+exports.check = check;
+exports.waitUntilFreeOnHost = waitUntilFreeOnHost;
+exports.waitUntilFree = waitUntilFree;
+exports.waitUntilUsedOnHost = waitUntilUsedOnHost;
+exports.waitUntilUsed = waitUntilUsed;
+exports.waitForStatus = waitForStatus;
+
+var is = require('is2');
+var Q = require('q');
 var net = require('net');
-//var debug = require('debug')('tcp-port-used-test');
+var util = require('util');
+var debug = require('debug')('tcp-port-used');
 
-var server;
+// Global Values
+var TIMEOUT = 2000;
+var RETRYTIME = 250;
 
-function freePort(cb) {
-    if (!server) {
-        return cb(new Error('Port not in use'));
-    }
-
-    server.close();
-    server.unref();
-    server = undefined;
-    cb();
+/**
+ * Creates an options object from all the possible arguments
+ * @private
+ * @param {Number} port a valid TCP port number
+ * @param {String} host The DNS name or IP address.
+ * @param {Boolean} status The desired in use status to wait for: false === not in use, true === in use
+ * @param {Number} retryTimeMs the retry interval in milliseconds - defaultis is 200ms
+ * @param {Number} timeOutMs the amount of time to wait until port is free default is 1000ms
+ * @return {Object} An options object with all the above parameters as properties.
+ */
+function makeOptionsObj(port, host, inUse, retryTimeMs, timeOutMs) {
+    var opts = {};
+    opts.port = port;
+    opts.host = host;
+    opts.inUse = inUse;
+    opts.retryTimeMs = retryTimeMs;
+    opts.timeOutMs = timeOutMs;
+    return opts;
 }
 
-function bindPort(port, cb) {
-    if (server) {
-        return cb(new Error('Free the server port, first.'));
+/**
+ * Checks if a TCP port is in use by creating the socket and binding it to the
+ * target port. Once bound, successfully, it's assume the port is availble.
+ * After the socket is closed or in error, the promise is resolved.
+ * Note: you have to be super user to correctly test system ports (0-1023).
+ * @param {Number|Object} port The port you are curious to see if available. If an object, must have the parameters as properties.
+ * @param {String} [host] May be a DNS name or IP address. Default '127.0.0.1'
+ * @return {Object} A deferred Q promise.
+ *
+ * Example usage:
+ *
+ * var tcpPortUsed = require('tcp-port-used');
+ * tcpPortUsed.check(22, '127.0.0.1')
+ * .then(function(inUse) {
+ *    debug('Port 22 usage: '+inUse);
+ * }, function(err) {
+ *    console.error('Error on check: '+util.inspect(err));
+ * });
+ */
+function check(port, host) {
+
+    var deferred = Q.defer();
+    var inUse = true;
+    var client;
+
+    var opts;
+    if (!is.obj(port)) {
+        opts = makeOptionsObj(port, host);
+    } else {
+        opts = port;
     }
 
-    server = net.createServer();
-    server.listen(port);
+    if (!is.port(opts.port)) {
+        debug('Error invalid port: '+util.inspect(opts.port));
+        deferred.reject(new Error('invalid port: '+util.inspect(opts.port)));
+        return deferred.promise;
+    }
 
-    function errEventCb(err) {
-        server.close();
-        if (cb) {
-            rmListeners();
-            cb(err);
+    if (is.nullOrUndefined(opts.host)) {
+        debug('set host address to default 127.0.0.1');
+        opts.host = '127.0.0.1';
+    }
+
+    function cleanUp() {
+        if (client) {
+            client.removeAllListeners('connect');
+            client.removeAllListeners('error');
+            client.end();
+            client.destroy();
+            client.unref();
         }
-        server = undefined;
+        //debug('listeners removed from client socket');
     }
 
-    function listenEventCb() {
-        if (cb) {
-            rmListeners();
-            cb();
+    function onConnectCb() {
+        //debug('check - promise resolved - in use');
+        deferred.resolve(inUse);
+        cleanUp();
+    }
+
+    function onErrorCb(err) {
+        if (err.code !== 'ECONNREFUSED') {
+            //debug('check - promise rejected, error: '+err.message);
+            deferred.reject(err);
+        } else {
+            //debug('ECONNREFUSED');
+            inUse = false;
+            //debug('check - promise resolved - not in use');
+            deferred.resolve(inUse);
         }
+        cleanUp();
     }
 
-    function rmListeners() {
-        server.removeListener('error', errEventCb);
-        server.removeListener('listening', listenEventCb);
-    }
+    client = new net.Socket();
+    client.once('connect', onConnectCb);
+    client.once('error', onErrorCb);
+    client.connect({port: opts.port, host: opts.host});
 
-    server.on('error', errEventCb);
-    server.on('listening', listenEventCb);
+    return deferred.promise;
 }
 
-describe('check arguments', function() {
-    it('should not accept negative port numbers in an obj', function(done) {
-        tcpPortUsed.check({ port: -20, host: '127.0.0.1' })
-        .then(function() {
-            done(new Error('check unexpectedly succeeded'));
-        }, function(err) {
-            assert.ok(err && err.message === 'invalid port: -20');
-            done();
-        });
-    });
+/**
+ * Creates a deferred promise and fulfills it only when the socket's usage
+ * equals status in terms of 'in use' (false === not in use, true === in use).
+ * Will retry on an interval specified in retryTimeMs.  Note: you have to be
+ * super user to correctly test system ports (0-1023).
+ * @param {Number|Object} port a valid TCP port number, if an object, has all the parameters described as properties.
+ * @param {String} host The DNS name or IP address.
+ * @param {Boolean} status The desired in use status to wait for false === not in use, true === in use
+ * @param {Number} [retryTimeMs] the retry interval in milliseconds - defaultis is 200ms
+ * @param {Number} [timeOutMs] the amount of time to wait until port is free default is 1000ms
+ * @return {Object} A deferred promise from the Q library.
+ *
+ * Example usage:
+ *
+ * var tcpPortUsed = require('tcp-port-used');
+ * tcpPortUsed.waitForStatus(44204, 'some.host.com', true, 500, 4000)
+ * .then(function() {
+ *     console.log('Port 44204 is now in use.');
+ * }, function(err) {
+ *     console.log('Error: ', error.message);
+ * });
+ */
+function waitForStatus(port, host, inUse, retryTimeMs, timeOutMs) {
 
-    it('should not accept negative port numbers', function(done) {
-        tcpPortUsed.check(-20, '127.0.0.1')
-        .then(function() {
-            done(new Error('check unexpectedly succeeded'));
-        }, function(err) {
-            assert.ok(err && err.message === 'invalid port: -20');
-            done();
-        });
-    });
+    var deferred = Q.defer();
+    var timeoutId;
+    var timedout = false;
+    var retryId;
 
-    it('should not accept invalid types for port numbers in an obj', function(done) {
-        tcpPortUsed.check({port:'hello', host:'127.0.0.1'})
-        .then(function() {
-            done(new Error('check unexpectedly succeeded'));
-        }, function(err) {
-            assert.ok(err && err.message === 'invalid port: \'hello\'');
-            done();
-        });
-    });
+    // the first arument may be an object, if it is not, make an object
+    var opts;
+    if (is.obj(port)) {
+        opts = port;
+    } else {
+        opts = makeOptionsObj(port, host, inUse, retryTimeMs, timeOutMs);
+    }
 
-    it('should not accept invalid types for port numbers', function(done) {
-        tcpPortUsed.check('hello', '127.0.0.1')
-        .then(function() {
-            done(new Error('check unexpectedly succeeded'));
-        }, function(err) {
-            assert.ok(err && err.message === 'invalid port: \'hello\'');
-            done();
-        });
-    });
+    //debug('opts:'+util.inspect(opts);
 
-    it('should require an argument for a port number in an obj', function(done) {
-        tcpPortUsed.check({})
-        .then(function() {
-            done(new Error('check unexpectedly succeeded'));
-        }, function(err) {
-            assert.ok(err && err.message === 'invalid port: undefined');
-            done();
-        });
-    });
+    if (!is.bool(opts.inUse)) {
+        deferred.reject(new Error('inUse must be a boolean'));
+        return deferred.promise;
+    }
 
-    it('should require an argument for a port number', function(done) {
-        tcpPortUsed.check()
-        .then(function() {
-            done(new Error('check unexpectedly succeeded'));
-        }, function(err) {
-            assert.ok(err && err.message === 'invalid port: undefined');
-            done();
-        });
-    });
+    if (!is.positiveInt(opts.retryTimeMs)) {
+        opts.retryTimeMs = RETRYTIME;
+        debug('set retryTime to default '+RETRYTIME+'ms');
+    }
 
-    it('should not accept port number > 65535 in an obj', function(done) {
-        tcpPortUsed.check({port: 65536})
-        .then(function() {
-            done(new Error('check unexpectedly succeeded'));
-        }, function(err) {
-            assert.ok(err && err.message === 'invalid port: 65536');
-            done();
-        });
-    });
+    if (!is.positiveInt(opts.timeOutMs)) {
+        opts.timeOutMs = TIMEOUT;
+        debug('set timeOutMs to default '+TIMEOUT+'ms');
+    }
 
+    function cleanUp() {
+        if (timeoutId) {
+            clearTimeout(timeoutId);
+        }
+        if (retryId) {
+            clearTimeout(retryId);
+        }
+    }
 
-    it('should not accept port number > 65535', function(done) {
-        tcpPortUsed.check(65536)
-        .then(function() {
-            done(new Error('check unexpectedly succeeded'));
-        }, function(err) {
-            assert.ok(err && err.message === 'invalid port: 65536');
-            done();
-        });
-    });
+    function timeoutFunc() {
+        timedout = true;
+        cleanUp();
+        deferred.reject(new Error('timeout'));
+    }
+    timeoutId = setTimeout(timeoutFunc, opts.timeOutMs);
 
-    it('should not accept port number < 0 in an obj', function(done) {
-        tcpPortUsed.check({port: -1})
-        .then(function() {
-            done(new Error('check unexpectedly succeeded'));
-        }, function(err) {
-            assert.ok(err && err.message === 'invalid port: -1');
-            done();
-        });
-    });
-
-    it('should not accept port number < 0', function(done) {
-        tcpPortUsed.check(-1)
-        .then(function() {
-            done(new Error('check unexpectedly succeeded'));
-        }, function(err) {
-            assert.ok(err && err.message === 'invalid port: -1');
-            done();
-        });
-    });
-});
-
-describe('check functionality for unused port', function() {
-    before(function(done) {
-        bindPort(44202, function(err) {
-            done(err);
-        });
-    });
-
-    it('should return true for a used port with default host value in an obj', function(done) {
-        tcpPortUsed.check({port: 44202})
+    function doCheck() {
+        check(opts.port, opts.host)
         .then(function(inUse) {
-            assert.ok(inUse === true);
-            done();
-        }, function(err) {
-            done(err);
-        });
-    });
-
-
-    it('should return true for a used port with default host value', function(done) {
-        tcpPortUsed.check(44202)
-        .then(function(inUse) {
-            assert.ok(inUse === true);
-            done();
-        }, function(err) {
-            done(err);
-        });
-    });
-
-    it('should return true for a used port with default host value using arg obj', function(done) {
-        tcpPortUsed.check({ port: 44202 })
-        .then(function(inUse) {
-            assert.ok(inUse === true);
-            done();
-        }, function(err) {
-            done(err);
-        });
-    });
-
-    it('should return true for a used port with given host value using arg obj', function(done) {
-        tcpPortUsed.check({port: 44202, host: '127.0.0.1'})
-        .then(function(inUse) {
-            assert.ok(inUse === true);
-            done();
-        }, function(err) {
-            assert.ok(false);
-            done(err);
-        });
-    });
-
-
-    it('should return true for a used port with given host value', function(done) {
-        tcpPortUsed.check(44202, '127.0.0.1')
-        .then(function(inUse) {
-            assert.ok(inUse === true);
-            done();
-        }, function(err) {
-            assert.ok(false);
-            done(err);
-        });
-    });
-
-    it('should return false for an unused port and default host using arg object', function(done) {
-        tcpPortUsed.check({port: 44201})
-        .then(function(inUse) {
-            assert.ok(inUse === false);
-            done();
-        }, function(err) {
-            done(err);
-        });
-    });
-
-
-    it('should return false for an unused port and default host', function(done) {
-        tcpPortUsed.check(44201)
-        .then(function(inUse) {
-            assert.ok(inUse === false);
-            done();
-        }, function(err) {
-            done(err);
-        });
-    });
-
-    it('should return false for an unused port and given default host using arg object', function(done) {
-        tcpPortUsed.check({port: 44201, host: '127.0.0.1'})
-        .then(function(inUse) {
-            assert.ok(inUse === false);
-            done();
-        }, function(err) {
-            done(err);
-        });
-    });
-
-    it('should return false for an unused port and given default host', function(done) {
-        tcpPortUsed.check(44201, '127.0.0.1')
-        .then(function(inUse) {
-            assert.ok(inUse === false);
-            done();
-        }, function(err) {
-            done(err);
-        });
-    });
-
-    after(function(cb) {
-        freePort(function(err) {
-            cb(err);
-        });
-    });
-});
-
-describe('waitUntilFreeOnHost', function() {
-    this.timeout(2000);
-
-    before(function(cb) {
-        bindPort(44203, function(err) {
-            cb(err);
-        });
-    });
-
-    it('should reject promise for used port number after timeout using an arg obj', function(done) {
-        tcpPortUsed.waitUntilFreeOnHost({port:44203, host:'127.0.0.1', retryTimeMs:500, timeOutMs:1000})
-        .then(function() {
-            done(new Error('waitUntilFreeOnHost unexpectedly succeeded'));
-        }, function(err) {
-            if (err.message === 'timeout') {
-                done();
-            } else {
-                done(err);
+            if (timedout) {
+                return;
             }
-        });
-    });
-
-    it('should reject promise for used port number after timeout', function(done) {
-        tcpPortUsed.waitUntilFreeOnHost(44203, '127.0.0.1', 500, 1000)
-        .then(function() {
-            done(new Error('waitUntilFreeOnHost unexpectedly succeeded'));
-        }, function(err) {
-            if (err.message === 'timeout') {
-                done();
+            //debug('doCheck inUse: '+inUse);
+            //debug('doCheck opts.inUse: '+opts.inUse);
+            if (inUse === opts.inUse) {
+                deferred.resolve();
+                cleanUp();
+                return;
             } else {
-                done(err);
+                retryId = setTimeout(function() { doCheck(); }, opts.retryTimeMs);
+                return;
             }
-        });
-    });
-
-    it('should fufill promise for free port number using an arg object', function(done) {
-        tcpPortUsed.waitUntilFreeOnHost({port:44205, host:'127.0.0.1', retryTimeMs:500, timeOutM:4000})
-        .then(function() {
-            done();
         }, function(err) {
-            done(err);
-        });
-    });
-
-
-    it('should fufill promise for free port number', function(done) {
-        tcpPortUsed.waitUntilFreeOnHost(44205, '127.0.0.1', 500, 4000)
-        .then(function() {
-            done();
-        }, function(err) {
-            done(err);
-        });
-    });
-
-    it('should fufill promise for free port number and default retry and timeout using an arg obj', function(done) {
-        tcpPortUsed.waitUntilFreeOnHost({port:44205})
-        .then(function() {
-            done();
-        }, function(err) {
-            done(err);
-        });
-    });
-
-
-    it('should fufill promise for free port number and default retry and timeout', function(done) {
-        tcpPortUsed.waitUntilFreeOnHost(44205)
-        .then(function() {
-            done();
-        }, function(err) {
-            done(err);
-        });
-    });
-
-    it('should reject promise for invalid port number using an arg obj', function(done) {
-        tcpPortUsed.waitUntilFreeOnHost({})
-        .then(function() {
-            done(new Error('waitUntilFreeOnHost unexpectedly succeeded'));
-        }, function(err) {
-            if (err.message === 'invalid port: undefined') {
-                done();
-            } else {
-                done(err);
+            if (timedout) {
+                return;
             }
+            deferred.reject(err);
+            cleanUp();
         });
-    });
+    }
 
-    it('should reject promise for invalid port number', function(done) {
-        tcpPortUsed.waitUntilFreeOnHost()
-        .then(function() {
-            done(new Error('waitUntilFreeOnHost unexpectedly succeeded'));
-        }, function(err) {
-            if (err.message === 'invalid port: undefined') {
-                done();
-            } else {
-                done(err);
-            }
-        });
-    });
+    doCheck();
+    return deferred.promise;
+}
 
-    after(function(cb) {
-        freePort(function(err) {
-            cb(err);
-        });
-    });
-});
+/**
+ * Creates a deferred promise and fulfills it only when the socket is free.
+ * Will retry on an interval specified in retryTimeMs.
+ * Note: you have to be super user to correctly test system ports (0-1023).
+ * @param {Number} port a valid TCP port number
+ * @param {String} [host] The hostname or IP address of where the socket is.
+ * @param {Number} [retryTimeMs] the retry interval in milliseconds - defaultis is 100ms.
+ * @param {Number} [timeOutMs] the amount of time to wait until port is free. Default 300ms.
+ * @return {Object} A deferred promise from the q library.
+ *
+ * Example usage:
+ *
+ * var tcpPortUsed = require('tcp-port-used');
+ * tcpPortUsed.waitUntilFreeOnHost(44203, 'some.host.com', 500, 4000)
+ * .then(function() {
+ *     console.log('Port 44203 is now free.');
+ *  }, function(err) {
+ *     console.loh('Error: ', error.message);
+ *  });
+ */
+function waitUntilFreeOnHost(port, host, retryTimeMs, timeOutMs) {
 
-describe('waitUntilUsedOnHost', function() {
+    // the first arument may be an object, if it is not, make an object
+    var opts;
+    if (is.obj(port)) {
+        opts = port;
+        opts.inUse = false;
+    } else {
+        opts = makeOptionsObj(port, host, false, retryTimeMs, timeOutMs);
+    }
 
-    before(function() {
-        setTimeout(function() {
-            bindPort(44204);
-        }, 2000);
-    });
+    return waitForStatus(opts);
+}
 
-    it('should wait until the port is listening using an arg object', function(done) {
-        this.timeout(5000);
-        tcpPortUsed.waitUntilUsedOnHost({port:44204, host:'127.0.0.1', retryTimeMs:500, timeOutMs:4000})
-        .then(function() {
-            done();
-        }, function(err) {
-            done(err);
-        });
-    });
+/**
+ * For compatibility with previous version of the module, that did not provide
+ * arguements for hostnames. The host is set to the localhost '127.0.0.1'.
+ * @param {Number|Object} port a valid TCP port number. If an object, must contain all the parameters as properties.
+ * @param {Number} [retryTimeMs] the retry interval in milliseconds - defaultis is 100ms.
+ * @param {Number} [timeOutMs] the amount of time to wait until port is free. Default 300ms.
+ * @return {Object} A deferred promise from the q library.
+ *
+ * Example usage:
+ *
+ * var tcpPortUsed = require('tcp-port-used');
+ * tcpPortUsed.waitUntilFree(44203, 500, 4000)
+ * .then(function() {
+ *     console.log('Port 44203 is now free.');
+ *  }, function(err) {
+ *     console.loh('Error: ', error.message);
+ *  });
+ */
+function waitUntilFree(port, retryTimeMs, timeOutMs) {
 
-    it('should wait until the port is listening', function(done) {
-        this.timeout(5000);
-        tcpPortUsed.waitUntilUsedOnHost(44204, '127.0.0.1', 500, 4000)
-        .then(function() {
-            done();
-        }, function(err) {
-            done(err);
-        });
-    });
+    // the first arument may be an object, if it is not, make an object
+    var opts;
+    if (is.obj(port)) {
+        opts = port;
+        opts.host = '127.0.0.1';
+        opts.inUse = false;
+    } else {
+        opts = makeOptionsObj(port, '127.0.0.1', false, retryTimeMs, timeOutMs);
+    }
 
-    it('should reject promise when given an invalid port using an arg object', function(done) {
-        this.timeout(3000);
-        tcpPortUsed.waitUntilUsedOnHost({port:'hello', host:'127.0.0.1', retryTimeMs:500, timeOutMs:2000})
-        .then(function() {
-            done(new Error('waitUntil used unexpectedly successful.'));
-        }, function(err) {
-            if (err.message === 'invalid port: \'hello\'') {
-                done();
-            } else {
-                done(err);
-            }
-        });
-    });
+    return waitForStatus(opts);
+}
 
-    it('should reject promise when given an invalid port', function(done) {
-        this.timeout(3000);
-        tcpPortUsed.waitUntilUsedOnHost('hello', '127.0.0.1', 500, 2000)
-        .then(function() {
-            done(new Error('waitUntil used unexpectedly successful.'));
-        }, function(err) {
-            if (err.message === 'invalid port: \'hello\'') {
-                done();
-            } else {
-                done(err);
-            }
-        });
-    });
+/**
+ * Creates a deferred promise and fulfills it only when the socket is used.
+ * Will retry on an interval specified in retryTimeMs.
+ * Note: you have to be super user to correctly test system ports (0-1023).
+ * @param {Number|Object} port a valid TCP port number. If an object, must contain all the parameters as properties.
+ * @param {Number} [retryTimeMs] the retry interval in milliseconds - defaultis is 500ms
+ * @param {Number} [timeOutMs] the amount of time to wait until port is free
+ * @return {Object} A deferred promise from the q library.
+ *
+ * Example usage:
+ *
+ * var tcpPortUsed = require('tcp-port-used');
+ * tcpPortUsed.waitUntilUsedOnHost(44204, 'some.host.com', 500, 4000)
+ * .then(function() {
+ *     console.log('Port 44204 is now in use.');
+ * }, function(err) {
+ *     console.log('Error: ', error.message);
+ * });
+ */
+function waitUntilUsedOnHost(port, host, retryTimeMs, timeOutMs) {
 
-    it('should timeout when no port is listening using an arg obj', function(done) {
-        this.timeout(3000);
-        tcpPortUsed.waitUntilUsedOnHost({port:44205, host:'127.0.0.1', retryTimeMs:500, tmieOutMs:2000})
-        .then(function() {
-            done(new Error('waitUntil used unexpectedly successful.'));
-        }, function(err) {
-            if (err.message === 'timeout') {
-                done();
-            } else {
-                done(err);
-            }
-        });
-    });
+    // the first arument may be an object, if it is not, make an object
+    var opts;
+    if (is.obj(port)) {
+        opts = port;
+        opts.inUse = true;
+    } else {
+        opts = makeOptionsObj(port, host, true, retryTimeMs, timeOutMs);
+    }
 
+    return waitForStatus(opts);
+}
 
-    it('should timeout when no port is listening', function(done) {
-        this.timeout(3000);
-        tcpPortUsed.waitUntilUsedOnHost(44205, '127.0.0.1', 500, 2000)
-        .then(function() {
-            done(new Error('waitUntil used unexpectedly successful.'));
-        }, function(err) {
-            if (err.message === 'timeout') {
-                done();
-            } else {
-                done(err);
-            }
-        });
-    });
+/**
+ * For compatibility to previous version of module which did not have support
+ * for host addresses. This function works only for localhost.
+ * @param {Number} port a valid TCP port number. If an Object, must contain all the parameters as properties.
+ * @param {Number} [retryTimeMs] the retry interval in milliseconds - defaultis is 500ms
+ * @param {Number} [timeOutMs] the amount of time to wait until port is free
+ * @return {Object} A deferred promise from the q library.
+ *
+ * Example usage:
+ *
+ * var tcpPortUsed = require('tcp-port-used');
+ * tcpPortUsed.waitUntilUsed(44204, 500, 4000)
+ * .then(function() {
+ *     console.log('Port 44204 is now in use.');
+ * }, function(err) {
+ *     console.log('Error: ', error.message);
+ * });
+ */
+function waitUntilUsed(port, retryTimeMs, timeOutMs) {
 
-    after(function(cb) {
-        freePort(function(err) {
-            cb(err);
-        });
-    });
-});
+    // the first arument may be an object, if it is not, make an object
+    var opts;
+    if (is.obj(port)) {
+        opts = port;
+        opts.host = '127.0.0.1';
+        opts.inUse = true;
+    } else {
+        opts = makeOptionsObj(port, '127.0.0.1', true, retryTimeMs, timeOutMs);
+    }
 
-describe('waitUntilFree', function() {
-    this.timeout(5000);
-
-    before(function(cb) {
-        bindPort(44203, function(err) {
-            cb(err);
-        });
-    });
-
-    it('should reject promise for used port number after timeout using arg obj', function(done) {
-        tcpPortUsed.waitUntilFree({port:44203, retryTimeMs:500, timeOutMs:4000})
-        .then(function() {
-            done(new Error('waitUntilFree unexpectedly succeeded'));
-        }, function(err) {
-            if (err.message === 'timeout') {
-                done();
-            } else {
-                done(err);
-            }
-        });
-    });
-
-    it('should reject promise for used port number after timeout', function(done) {
-        tcpPortUsed.waitUntilFree(44203, 500, 4000)
-        .then(function() {
-            done(new Error('waitUntilFree unexpectedly succeeded'));
-        }, function(err) {
-            if (err.message === 'timeout') {
-                done();
-            } else {
-                done(err);
-            }
-        });
-    });
-
-    it('should fufill promise for free port number using arg object', function(done) {
-        tcpPortUsed.waitUntilFree({port:44205, retryTimeMs:500, timeOutMs:4000})
-        .then(function() {
-            done();
-        }, function(err) {
-            done(err);
-        });
-    });
-
-    it('should fufill promise for free port number', function(done) {
-        tcpPortUsed.waitUntilFree(44205, 500, 4000)
-        .then(function() {
-            done();
-        }, function(err) {
-            done(err);
-        });
-    });
-
-    it('should fufill promise for free port number and default retry and timeout using arg object', function(done) {
-        tcpPortUsed.waitUntilFree({port: 44205})
-        .then(function() {
-            done();
-        }, function(err) {
-            done(err);
-        });
-    });
-
-    it('should fufill promise for free port number and default retry and timeout', function(done) {
-        tcpPortUsed.waitUntilFree(44205)
-        .then(function() {
-            done();
-        }, function(err) {
-            done(err);
-        });
-    });
-
-    it('should reject promise for invalid port number using arg object', function(done) {
-        tcpPortUsed.waitUntilFree({})
-        .then(function() {
-            done(new Error('waitUntilFreeOnHost: unexpectedly succeeded'));
-        }, function(err) {
-            if (err.message === 'invalid port: undefined') {
-                done();
-            } else {
-                done(err);
-            }
-        });
-    });
-
-    it('should reject promise for invalid port number', function(done) {
-        tcpPortUsed.waitUntilFree()
-        .then(function() {
-            done(new Error('waitUntilFreeOnHost: unexpectedly succeeded'));
-        }, function(err) {
-            if (err.message === 'invalid port: undefined') {
-                done();
-            } else {
-                done(err);
-            }
-        });
-    });
-
-    after(function(cb) {
-        freePort(function(err) {
-            cb(err);
-        });
-    });
-});
-
-describe('waitUntilUsed', function() {
-
-    before(function() {
-        setTimeout(function() {
-            bindPort(44204);
-        }, 2000);
-    });
-
-    it('should wait until the port is listening using arg obj', function(done) {
-        this.timeout(5000);
-        tcpPortUsed.waitUntilUsed({port:44204, retryTimeMs:500, timeOutMs:4000})
-        .then(function() {
-            done();
-        }, function(err) {
-            done(err);
-        });
-    });
-
-    it('should wait until the port is listening', function(done) {
-        this.timeout(5000);
-        tcpPortUsed.waitUntilUsed(44204, 500, 4000)
-        .then(function() {
-            done();
-        }, function(err) {
-            done(err);
-        });
-    });
-
-    it('should reject promise when given an invalid port using arg object', function(done) {
-        this.timeout(3000);
-        tcpPortUsed.waitUntilUsed({port:'hello', retryTimeMs:500, timeOutMs:2000})
-        .then(function() {
-            done(new Error('waitUntil used unexpectedly successful.'));
-        }, function(err) {
-            if (err.message === 'invalid port: \'hello\'') {
-                done();
-            } else {
-                done(err);
-            }
-        });
-    });
-
-    it('should reject promise when given an invalid port', function(done) {
-        this.timeout(3000);
-        tcpPortUsed.waitUntilUsed('hello', 500, 2000)
-        .then(function() {
-            done(new Error('waitUntil used unexpectedly successful.'));
-        }, function(err) {
-            if (err.message === 'invalid port: \'hello\'') {
-                done();
-            } else {
-                done(err);
-            }
-        });
-    });
-
-    it('should timeout when no port is listening using arg obj', function(done) {
-        this.timeout(3000);
-        tcpPortUsed.waitUntilUsed({port:44205, retryTimeMs:500, timeOutMs:2000})
-        .then(function() {
-            done(new Error('waitUntil used unexpectedly successful.'));
-        }, function(err) {
-            if (err.message === 'timeout') {
-                done();
-            } else {
-                done(err);
-            }
-        });
-    });
-
-    it('should timeout when no port is listening', function(done) {
-        this.timeout(3000);
-        tcpPortUsed.waitUntilUsed(44205, 500, 2000)
-        .then(function() {
-            done(new Error('waitUntil used unexpectedly successful.'));
-        }, function(err) {
-            if (err.message === 'timeout') {
-                done();
-            } else {
-                done(err);
-            }
-        });
-    });
-
-    after(function(cb) {
-        freePort(function(err) {
-            cb(err);
-        });
-    });
-});
-
-describe('waitForStatus', function() {
-
-    before(function() {
-        setTimeout(function() {
-            bindPort(44204);
-        }, 2000);
-    });
-
-    it('should wait until the port is listening using arg obj', function(done) {
-        this.timeout(5000);
-        tcpPortUsed.waitForStatus({port:44204, host:'127.0.0.1', inUse:true, retryTimeMs:500, timeOutMs:4000})
-        .then(function() {
-            done();
-        }, function(err) {
-            done(err);
-        });
-    });
-
-    it('should wait until the port is listening', function(done) {
-        this.timeout(5000);
-        tcpPortUsed.waitForStatus(44204, '127.0.0.1', true, 500, 4000)
-        .then(function() {
-            done();
-        }, function(err) {
-            done(err);
-        });
-    });
-
-    it('should reject promise when given an invalid port using arg object', function(done) {
-        this.timeout(3000);
-        tcpPortUsed.waitForStatus({port:'hello', host:'127.0.0.1', inUse:false, retryTimeMs:500, timeOutMs:2000})
-        .then(function() {
-            done(new Error('waitUntil used unexpectedly successful.'));
-        }, function(err) {
-            if (err.message === 'invalid port: \'hello\'') {
-                done();
-            } else {
-                done(err);
-            }
-        });
-    });
-
-    it('should reject promise when given an invalid port', function(done) {
-        this.timeout(3000);
-        tcpPortUsed.waitForStatus('hello', '127.0.0.1', false, 500, 2000)
-        .then(function() {
-            done(new Error('waitUntil used unexpectedly successful.'));
-        }, function(err) {
-            if (err.message === 'invalid port: \'hello\'') {
-                done();
-            } else {
-                done(err);
-            }
-        });
-    });
-
-    it('should timeout when no port is listening using arg obj', function(done) {
-        this.timeout(3000);
-        tcpPortUsed.waitUntilUsed({port:44205, host:'127.0.0.1', inUse:true, retryTimeMs:500, timeOutMs:2000})
-        .then(function() {
-            done(new Error('waitUntil used unexpectedly successful.'));
-        }, function(err) {
-            if (err.message === 'timeout') {
-                done();
-            } else {
-                done(err);
-            }
-        });
-    });
-
-    it('should timeout when no port is listening', function(done) {
-        this.timeout(3000);
-        tcpPortUsed.waitUntilUsed(44205, '127.0.0.1', true, 500, 2000)
-        .then(function() {
-            done(new Error('waitUntil used unexpectedly successful.'));
-        }, function(err) {
-            if (err.message === 'timeout') {
-                done();
-            } else {
-                done(err);
-            }
-        });
-    });
-
-    after(function(cb) {
-        freePort(function(err) {
-            cb(err);
-        });
-    });
-});
+    return waitUntilUsedOnHost(opts);
+}
